@@ -9,6 +9,9 @@
 #include <memory>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string_view>
+#include <vector>
 #include <tuple>
 #include <set>
 #include <fstream>
@@ -291,6 +294,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateDynamicStates();
     }
+
+    RealignVertexStreams(*pipeline);
 
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
@@ -2219,6 +2224,171 @@ void RasterizerVulkan::UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& 
     }
     scheduler.Record([enable = regs.stencil_enable](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetStencilTestEnableEXT(enable);
+    });
+}
+
+void RasterizerVulkan::RealignVertexStreams(const GraphicsPipeline& pipeline) {
+    // Tegra fetches vertex attributes from any byte address, Vulkan requires them to be aligned to
+    // their component size and AMD returns garbage otherwise. Splatoon Raiders packs its foliage
+    // cards at a stride of 69 bytes, so such streams are copied into an aligned layout per draw.
+    // EDEN_NX2_REALIGN_VERTEX=0 keeps the guest layout.
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_REALIGN_VERTEX");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
+    if (!enabled) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto component_alignment = [](const Maxwell::VertexAttribute& attribute) -> u32 {
+        switch (attribute.size.Value()) {
+        case Maxwell::VertexAttribute::Size::Size_R32_G32_B32_A32:
+        case Maxwell::VertexAttribute::Size::Size_R32_G32_B32:
+        case Maxwell::VertexAttribute::Size::Size_R32_G32:
+        case Maxwell::VertexAttribute::Size::Size_R32:
+        case Maxwell::VertexAttribute::Size::Size_A2_B10_G10_R10:
+        case Maxwell::VertexAttribute::Size::Size_B10_G11_R11:
+            return 4;
+        case Maxwell::VertexAttribute::Size::Size_R16_G16_B16_A16:
+        case Maxwell::VertexAttribute::Size::Size_R16_G16_B16:
+        case Maxwell::VertexAttribute::Size::Size_R16_G16:
+        case Maxwell::VertexAttribute::Size::Size_R16:
+            return 2;
+        default:
+            return 1;
+        }
+    };
+    const u32 max_attributes = static_cast<u32>(
+        std::min<size_t>(Maxwell::NumVertexAttributes, device.GetMaxVertexInputAttributes()));
+    const u32 max_bindings = static_cast<u32>(
+        std::min<size_t>(Maxwell::NumVertexArrays, device.GetMaxVertexInputBindings()));
+    u32 misaligned_streams = 0;
+    for (u32 index = 0; index < max_attributes; ++index) {
+        const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
+        const u32 binding = attribute.buffer;
+        if (attribute.constant || binding >= max_bindings ||
+            !pipeline.LoadsGenericAttribute(index) || !regs.vertex_streams[binding].IsEnabled()) {
+            continue;
+        }
+        const u32 alignment = component_alignment(attribute);
+        if (attribute.offset % alignment != 0 ||
+            regs.vertex_streams[binding].stride % alignment != 0) {
+            misaligned_streams |= 1U << binding;
+        }
+    }
+    if (misaligned_streams == 0) {
+        return;
+    }
+    if (!pipeline.HasDynamicVertexInput()) {
+        static std::once_flag warned;
+        std::call_once(warned, [] {
+            LOG_WARNING(HW_GPU, "Misaligned vertex stream without dynamic vertex input");
+        });
+        return;
+    }
+
+    boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    std::array<u32, Maxwell::NumVertexArrays> new_strides{};
+    struct Field {
+        u32 source;
+        u32 target;
+        u32 size;
+    };
+    std::array<boost::container::static_vector<Field, 32>, Maxwell::NumVertexArrays> fields;
+    for (u32 index = 0; index < max_attributes; ++index) {
+        const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
+        const u32 binding = attribute.buffer;
+        if (attribute.constant || binding >= max_bindings) {
+            continue;
+        }
+        u32 offset = attribute.offset;
+        if ((misaligned_streams >> binding) & 1U) {
+            if (!pipeline.LoadsGenericAttribute(index)) {
+                continue;
+            }
+            offset = new_strides[binding];
+            fields[binding].push_back({attribute.offset, offset, attribute.SizeInBytes()});
+            new_strides[binding] += Common::AlignUp(attribute.SizeInBytes(), 4U);
+        }
+        attributes.push_back({
+            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+            .pNext = nullptr,
+            .location = index,
+            .binding = binding,
+            .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
+            .offset = offset,
+        });
+    }
+    boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+    for (u32 binding = 0; binding < max_bindings; ++binding) {
+        const auto& stream = regs.vertex_streams[binding];
+        const bool is_instanced = regs.vertex_stream_instances.IsInstancingEnabled(binding);
+        const bool realigned = ((misaligned_streams >> binding) & 1U) != 0;
+        bindings.push_back({
+            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+            .pNext = nullptr,
+            .binding = binding,
+            .stride = realigned ? new_strides[binding] : static_cast<u32>(stream.stride),
+            .inputRate = is_instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
+            .divisor = is_instanced ? stream.frequency : 1,
+        });
+    }
+
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    auto& dirty = maxwell3d->dirty.flags;
+    static constexpr u64 MAX_STREAM_SIZE = 64ULL * 1024 * 1024;
+    thread_local std::vector<u8> guest_bytes;
+    for (u32 binding = 0; binding < max_bindings; ++binding) {
+        if (((misaligned_streams >> binding) & 1U) == 0) {
+            continue;
+        }
+        const auto& stream = regs.vertex_streams[binding];
+        const GPUVAddr address = stream.Address();
+        const u64 guest_size =
+            native ? regs.NativeVertexStreamSize(binding)
+                   : regs.vertex_stream_limits[binding].Address() + 1 - address;
+        const u64 size = std::min(guest_size, MAX_STREAM_SIZE);
+        const u32 stride = stream.stride;
+        const u64 vertices = stride != 0 ? size / stride : 1;
+        const u32 new_stride = new_strides[binding];
+        if (size == 0 || vertices == 0 || new_stride == 0) {
+            continue;
+        }
+        guest_bytes.resize(size);
+        gpu_memory->ReadBlockUnsafe(address, guest_bytes.data(), guest_bytes.size());
+
+        const StagingBufferRef upload =
+            staging_pool.Request(vertices * new_stride, MemoryUsage::Upload);
+        u8* const target = upload.mapped_span.data();
+        std::memset(target, 0, vertices * new_stride);
+        for (u64 vertex = 0; vertex < vertices; ++vertex) {
+            for (const Field& field : fields[binding]) {
+                const u64 source = vertex * stride + field.source;
+                if (source + field.size <= size) {
+                    std::memcpy(target + vertex * new_stride + field.target,
+                                guest_bytes.data() + source, field.size);
+                }
+            }
+        }
+
+        static std::set<u32> reported_strides;
+        if (reported_strides.size() < 32 && reported_strides.insert(stride).second) {
+            LOG_INFO(HW_GPU, "Realigning vertex stream {}: stride {} -> {}", binding, stride, new_stride);
+        }
+
+        scheduler.Record([buffer = upload.buffer, offset = upload.offset,
+                          bound_size = vertices * new_stride, new_stride,
+                          binding](vk::CommandBuffer cmdbuf) {
+            const VkDeviceSize vk_stride = new_stride;
+            cmdbuf.BindVertexBuffers2EXT(binding, 1, &buffer, &offset, &bound_size, &vk_stride);
+        });
+        // The next draw has to rebind the guest's own buffer.
+        dirty[VideoCommon::Dirty::VertexBuffers] = true;
+        dirty[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
+    }
+    dirty[Dirty::VertexInput] = true;
+    scheduler.Record([bindings, attributes](vk::CommandBuffer cmdbuf) {
+        cmdbuf.SetVertexInputEXT(bindings, attributes);
     });
 }
 

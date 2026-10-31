@@ -197,6 +197,9 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// Rebinds vertex streams whose attributes break Vulkan's alignment rules.
+    void RealignVertexStreams(const GraphicsPipeline& pipeline);
+
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 

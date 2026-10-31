@@ -2071,6 +2071,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
+    // A fully cleared render target skips the upload, so it would be used without ever leaving
+    // VK_IMAGE_LAYOUT_UNDEFINED, which leaves compression metadata uninitialised on AMD.
+    runtime.TransitionImageLayout(new_image);
 
     new_image.allocation_tick = frame_tick;
     {
