@@ -33,6 +33,7 @@ struct BlitImagePipelineKey {
 
     VkRenderPass renderpass;
     Tegra::Engines::Fermi2D::Operation operation;
+    bool decode_srgb = false;
 };
 
 struct BlitDepthStencilPipelineKey {
@@ -76,7 +77,7 @@ public:
     void BlitColor(const Framebuffer* dst_framebuffer, const ImageView& src_image_view,
                    const Region2D& dst_region, const Region2D& src_region,
                    Tegra::Engines::Fermi2D::Filter filter,
-                   Tegra::Engines::Fermi2D::Operation operation);
+                   Tegra::Engines::Fermi2D::Operation operation, bool decode_srgb = false);
 
     void BlitColor(const Framebuffer* dst_framebuffer, VkImageView src_image_view,
                    VkImage src_image, VkSampler src_sampler, const Region2D& dst_region,
@@ -216,6 +217,7 @@ private:
     vk::PipelineLayout msaa_copy_depth_stencil_pipeline_layout;
     vk::ShaderModule full_screen_vert;
     vk::ShaderModule blit_color_to_color_frag;
+    vk::ShaderModule blit_color_srgb_decode_frag;
     vk::ShaderModule blit_color_msaa_frag;
     vk::ShaderModule blit_depth_stencil_frag;
     vk::ShaderModule blit_depth_frag;

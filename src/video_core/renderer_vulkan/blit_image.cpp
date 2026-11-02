@@ -12,6 +12,7 @@
 #include "common/settings.h"
 #include "video_core/host_shaders/blit_color_float_frag_spv.h"
 #include "video_core/host_shaders/blit_color_msaa_frag_spv.h"
+#include "video_core/host_shaders/blit_color_srgb_decode_frag_spv.h"
 #include "video_core/host_shaders/blit_depth_frag_spv.h"
 #include "video_core/host_shaders/blit_depth_msaa_frag_spv.h"
 #include "video_core/host_shaders/blit_depth_stencil_msaa_frag_spv.h"
@@ -612,6 +613,7 @@ BlitImageHelper::BlitImageHelper(const Device& device_, Scheduler& scheduler_,
               PUSH_CONSTANT_RANGE<VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(MSAACopyPushConstants)>))),
       full_screen_vert(BuildShader(device, FULL_SCREEN_TRIANGLE_VERT_SPV)),
       blit_color_to_color_frag(BuildShader(device, BLIT_COLOR_FLOAT_FRAG_SPV)),
+      blit_color_srgb_decode_frag(BuildShader(device, BLIT_COLOR_SRGB_DECODE_FRAG_SPV)),
       blit_color_msaa_frag(BuildShader(device, BLIT_COLOR_MSAA_FRAG_SPV)),
       blit_depth_stencil_frag(device.IsExtShaderStencilExportSupported()
                              ? BuildShader(device, VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV)
@@ -661,11 +663,12 @@ BlitImageHelper::~BlitImageHelper() = default;
 void BlitImageHelper::BlitColor(const Framebuffer* dst_framebuffer, const ImageView& src_image_view,
                                 const Region2D& dst_region, const Region2D& src_region,
                                 Tegra::Engines::Fermi2D::Filter filter,
-                                Tegra::Engines::Fermi2D::Operation operation) {
+                                Tegra::Engines::Fermi2D::Operation operation, bool decode_srgb) {
     const bool is_linear = filter == Tegra::Engines::Fermi2D::Filter::Bilinear;
     const BlitImagePipelineKey key{
         .renderpass = dst_framebuffer->RenderPass(),
         .operation = operation,
+        .decode_srgb = decode_srgb,
     };
     VkSampler sampler = *nearest_sampler;
     if (is_linear) {
@@ -1237,7 +1240,8 @@ VkPipeline BlitImageHelper::FindOrEmplaceColorPipeline(const BlitImagePipelineKe
     }
     blit_color_keys.push_back(key);
 
-    const std::array stages = MakeStages(*full_screen_vert, *blit_color_to_color_frag);
+    const std::array stages = MakeStages(
+        *full_screen_vert, key.decode_srgb ? *blit_color_srgb_decode_frag : *blit_color_to_color_frag);
     const VkPipelineColorBlendAttachmentState blend_attachment{
         .blendEnable = VK_FALSE,
         .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,

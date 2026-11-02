@@ -628,6 +628,14 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
+    // The game hands the network sRGB encoded values and encodes its output itself when it
+    // presents, so the network has to return linear values. A plain copy would encode them twice.
+    static const bool decode_input = [] {
+        const char* value = std::getenv("EDEN_NX2_UPSCALE_DECODE");
+        return !value || value[0] != '0';
+    }();
+    const bool is_unorm = format == RTFormat::A2B10G10R10_UNORM ||
+                          format == RTFormat::A8B8G8R8_UNORM;
     const Fermi2D::Config config{
         .operation = Fermi2D::Operation::SrcCopy,
         .filter = Fermi2D::Filter::Bilinear,
@@ -640,6 +648,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         .src_y0 = 0,
         .src_x1 = static_cast<s32>(input->Width()),
         .src_y1 = static_cast<s32>(input->Height()),
+        .decode_srgb = decode_input && is_unorm,
     };
     // Debug: does the input hold anything? Download it once and count non-zero words.
     static const u32 sample_at = [] {

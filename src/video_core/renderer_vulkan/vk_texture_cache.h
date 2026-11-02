@@ -85,7 +85,7 @@ public:
     void BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
                    const Region2D& dst_region, const Region2D& src_region,
                    Tegra::Engines::Fermi2D::Filter filter,
-                   Tegra::Engines::Fermi2D::Operation operation);
+                   Tegra::Engines::Fermi2D::Operation operation, bool decode_srgb = false);
 
     void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 

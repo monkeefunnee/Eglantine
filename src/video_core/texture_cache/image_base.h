@@ -120,6 +120,7 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    u64 alias_batch_key = 0; ///< Render target and barrier state of the last batched alias copy.
     size_t lru_index = SIZE_MAX;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};

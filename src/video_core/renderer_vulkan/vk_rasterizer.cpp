@@ -236,6 +236,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
+    const char* alias_batch = std::getenv("EDEN_NX2_ALIAS_BATCH");
+    texture_cache.SetAliasBatching(alias_batch == nullptr || alias_batch[0] != '0');
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -1170,6 +1172,7 @@ void RasterizerVulkan::WaitForIdle() {
     }
 
     query_cache.NotifyWFI();
+    texture_cache.NotifyTextureBarrier();
 
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([event = *wfi_event, flags](vk::CommandBuffer cmdbuf) {
@@ -1181,11 +1184,13 @@ void RasterizerVulkan::WaitForIdle() {
 
 void RasterizerVulkan::FragmentBarrier() {
     // We already put barriers when a render pass finishes
+    texture_cache.NotifyTextureBarrier();
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
 void RasterizerVulkan::TiledCacheBarrier() {
     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
+    texture_cache.NotifyTextureBarrier();
 }
 
 void RasterizerVulkan::FlushCommands() {

@@ -302,6 +302,7 @@ public:
         s32 src_y0;
         s32 src_x1;
         s32 src_y1;
+        bool decode_srgb = false; ///< Convert sRGB encoded source values to linear (Vulkan only)
     };
 
 private:

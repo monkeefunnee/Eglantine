@@ -352,13 +352,18 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
 template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
     bool has_blacklisted = false;
+    if (compute) {
+        ++texture_barrier_serial;
+    }
     do {
         has_deleted_images = false;
         if (blacklist) {
             has_blacklisted = false;
         }
         for (ImageViewInOut& view : views) {
+            alias_batch_draw = alias_batching && !compute && !view.blacklist;
             view.id = VisitImageView(view.index, compute);
+            alias_batch_draw = false;
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -596,6 +601,9 @@ template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     using namespace VideoCommon::Dirty;
     auto& flags = maxwell3d->dirty.flags;
+    if (is_clear) {
+        ++texture_barrier_serial;
+    }
     if (!flags[Dirty::RenderTargets]) {
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
@@ -853,6 +861,7 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
     const ImageId dst_id = images.dst_id;
     const ImageId src_id = images.src_id;
 
+    ++texture_barrier_serial;
     PrepareImage(src_id, false, false);
     PrepareImage(dst_id, true, false);
 
@@ -942,7 +951,7 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
         ImageView& dst_view = slot_image_views[dst_view_id];
         ImageView& src_view = slot_image_views[src_view_id];
         runtime.BlitImage(dst_framebuffer, dst_view, src_view, dst_region, src_region, copy.filter,
-                          copy.operation);
+                          copy.operation, copy.decode_srgb);
     }
     return true;
 }
@@ -2948,6 +2957,34 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     }
     if (aliased_images.empty()) {
         return;
+    }
+    // A draw that samples an alias of its own render target would end the render pass for a copy
+    // on every draw, about 400 times a frame in Splatoon Raiders. Without a barrier in between
+    // the guest cannot rely on seeing its earlier draws, so one copy per barrier is enough.
+    if (alias_batch_draw) {
+        // The guest may rewrite the render target registers on every draw, so check their values
+        // rather than the dirty flag: the upcoming draw must still target the same image.
+        const auto& regs = maxwell3d->regs;
+        const auto is_bound = [&](const AliasedImage* aliased) {
+            const ImageBase& target = slot_images[aliased->id];
+            for (size_t i = 0; i < rt_image_id.size() && i < regs.rt_control.count; ++i) {
+                if ((rt_active_mask & (1u << i)) && rt_image_id[i] == aliased->id &&
+                    regs.rt[i].Address() == target.gpu_addr &&
+                    regs.rt[i].width == target.info.size.width &&
+                    VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[i].format) ==
+                        target.info.format) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (std::ranges::all_of(aliased_images, is_bound)) {
+            const u64 key = (render_targets_serial << 32) + texture_barrier_serial + 1;
+            if (image.alias_batch_key == key) {
+                return;
+            }
+            image.alias_batch_key = key;
+        }
     }
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {

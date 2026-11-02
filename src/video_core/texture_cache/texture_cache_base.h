@@ -215,6 +215,16 @@ public:
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
+    /// Refresh a texture from its draw's own render target only once per barrier
+    void SetAliasBatching(bool enabled) noexcept {
+        alias_batching = enabled;
+    }
+
+    /// A guest barrier makes earlier draws visible to texture reads
+    void NotifyTextureBarrier() noexcept {
+        ++texture_barrier_serial;
+    }
+
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
 
@@ -484,6 +494,9 @@ private:
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;
+    bool alias_batching = false;
+    bool alias_batch_draw = false;
+    u64 texture_barrier_serial = 0;
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 
